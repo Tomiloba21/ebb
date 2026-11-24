@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Ebb
+Comment=Start, stop and watch your dev projects
+Exec=@BIN@
+Icon=io.github.tomiloba21.Ebb
+Terminal=false
+Categories=Development;
+Keywords=dev;launcher;services;backend;emulator;
+StartupNotify=true
+StartupWMClass=io.github.tomiloba21.Ebb

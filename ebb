@@ -1,0 +1,1114 @@
+#!/usr/bin/env python3
+"""Ebb: start, stop and watch your dev projects from one window.
+
+Usage:
+  ebb [--project NAME]          open the window (optionally on one project)
+  ebb list                      list projects, services and actions
+  ebb status [PROJECT]          show service status
+  ebb start PROJECT [SERVICE]   start one service, or all of a project's services
+  ebb stop PROJECT [SERVICE]    stop one service, or all of a project's services
+  ebb run PROJECT ACTION        run an action and wait for it
+
+Projects are defined in ~/.config/ebb/config.toml (or $EBB_CONFIG).
+Logs and pid files live in ~/.local/state/ebb/.
+"""
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import tomllib
+import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
+
+APP_ID = "io.github.tomiloba21.Ebb"
+CONFIG = Path(os.environ.get("EBB_CONFIG") or
+              Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "ebb/config.toml")
+STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "ebb"
+
+STOPPED, STARTING, RUNNING = "Stopped", "Starting…", "Running"
+
+
+# --- config ---
+
+class ConfigError(Exception):
+    pass
+
+
+def slug(name):
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "item"
+
+
+def expand(value):
+    return os.path.expandvars(os.path.expanduser(str(value)))
+
+
+@dataclass
+class Service:
+    name: str
+    start: str
+    cwd: Path
+    env: dict
+    log: Path
+    description: str = ""
+    icon: str = "system-run-symbolic"
+    stop: str | None = None
+    http: str | None = None
+    port: int | None = None
+    process: str | None = None
+    ready: str | None = None
+
+
+@dataclass
+class Action:
+    name: str
+    run: str
+    cwd: Path
+    env: dict
+    log: Path
+    description: str = ""
+    icon: str = "media-playback-start-symbolic"
+    highlight: bool = False
+
+
+@dataclass
+class Project:
+    name: str
+    cwd: Path
+    description: str = ""
+    services: list = field(default_factory=list)
+    actions: list = field(default_factory=list)
+
+    def service(self, name):
+        return find(self.services, name, f"service in {self.name}")
+
+    def action(self, name):
+        return find(self.actions, name, f"action in {self.name}")
+
+
+def find(items, name, what):
+    for item in items:
+        if item.name.lower() == name.lower() or slug(item.name) == slug(name):
+            return item
+    raise ConfigError(f"No {what} called '{name}'. Try: {', '.join(i.name for i in items) or 'none defined'}")
+
+
+def read_raw(path=CONFIG):
+    """The config file as plain dicts and lists; empty if there is no file yet."""
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        raise ConfigError(f"{path}: {e}") from e
+
+
+def load_config(path=CONFIG):
+    return parse(read_raw(path))
+
+
+BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
+KEY_ORDER = ["name", "description", "cwd", "icon", "start", "stop", "run", "http", "port", "ready", "process",
+             "highlight", "env"]
+
+
+def toml_key(key):
+    return key if BARE_KEY.match(key) else json.dumps(key, ensure_ascii=False)
+
+
+def toml_value(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)  # JSON strings are valid TOML basic strings
+    if isinstance(value, dict):
+        return "{ " + ", ".join(f"{toml_key(k)} = {toml_value(v)}" for k, v in value.items()) + " }"
+    if isinstance(value, list):
+        return "[" + ", ".join(toml_value(v) for v in value) + "]"
+    raise ConfigError(f"Can't save a value of type {type(value).__name__}")
+
+
+def toml_lines(table, indent="", skip=()):
+    keys = sorted((k for k in table if k not in skip),
+                  key=lambda k: KEY_ORDER.index(k) if k in KEY_ORDER else len(KEY_ORDER))
+    return [f"{indent}{toml_key(k)} = {toml_value(table[k])}" for k in keys if table[k] not in ("", None, {}, [])]
+
+
+def to_toml(data):
+    out = ["# Ebb config. Edit it in Ebb, or by hand: README.md describes every key.", ""]
+    out += toml_lines(data, skip=("env", "project"))
+    if data.get("env"):
+        out += ["[env]"] + toml_lines(data["env"]) + [""]
+    for project in data.get("project", []):
+        out += ["", "[[project]]"] + toml_lines(project, skip=("service", "action"))
+        for kind in ("service", "action"):
+            for item in project.get(kind, []):
+                out += ["", f"  [[project.{kind}]]"] + toml_lines(item, "  ")
+    return "\n".join(out).strip() + "\n"
+
+
+def save_raw(data, path=CONFIG):
+    """Write the config, keeping the previous file as config.toml.bak. Comments are not preserved."""
+    text = to_toml(data)
+    parse(tomllib.loads(text))  # never write a file Ebb can't read back
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        shutil.copy2(path, path.with_name(path.name + ".bak"))
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def parse(data):
+    def env_of(table):
+        return {k: expand(v) for k, v in table.get("env", {}).items()}
+
+    def required(table, key, where):
+        if not table.get(key):
+            raise ConfigError(f"{where} is missing '{key}'")
+        return table[key]
+
+    global_env = env_of(data)
+    projects = []
+    for p in data.get("project", []):
+        pname = required(p, "name", "A [[project]]")
+        if any(slug(other.name) == slug(pname) for other in projects):
+            raise ConfigError(f"Two projects are called '{pname}'")
+        pcwd = Path(expand(p.get("cwd", "~")))
+        penv = {**global_env, **env_of(p)}
+        project = Project(pname, pcwd, p.get("description", ""))
+        state = STATE / slug(pname)
+
+        for s in p.get("service", []):
+            sname = required(s, "name", f"A service in '{pname}'")
+            port = s.get("port")
+            project.services.append(Service(
+                name=sname,
+                start=required(s, "start", f"Service '{sname}' in '{pname}'"),
+                cwd=pcwd / expand(s.get("cwd", ".")),
+                env={**penv, **env_of(s)},
+                log=state / f"{slug(sname)}.log",
+                description=s.get("description", ""),
+                icon=s.get("icon", "system-run-symbolic"),
+                stop=s.get("stop"),
+                http=s.get("http"),
+                port=int(port) if port else None,
+                process=s.get("process"),
+                ready=s.get("ready"),
+            ))
+        for a in p.get("action", []):
+            aname = required(a, "name", f"An action in '{pname}'")
+            project.actions.append(Action(
+                name=aname,
+                run=required(a, "run", f"Action '{aname}' in '{pname}'"),
+                cwd=pcwd / expand(a.get("cwd", ".")),
+                env={**penv, **env_of(a)},
+                log=state / f"action-{slug(aname)}.log",
+                description=a.get("description", ""),
+                icon=a.get("icon", "media-playback-start-symbolic"),
+                highlight=bool(a.get("highlight", False)),
+            ))
+        projects.append(project)
+    return projects
+
+
+# --- processes ---
+
+CHILDREN = {}  # pid -> Popen, so the window can reap services that exit while it is open
+
+
+def shell(cmd, login=True):
+    return ["bash", "-lc" if login else "-c", cmd]
+
+
+def environ(item):
+    return {**os.environ, **item.env}
+
+
+def check_cwd(item):
+    if not item.cwd.is_dir():
+        raise ConfigError(f"{item.name}: folder {item.cwd} does not exist")
+
+
+def pidfile(svc):
+    return svc.log.with_suffix(".pid")
+
+
+def group_alive(pid):
+    if pid in CHILDREN and CHILDREN[pid].poll() is not None:
+        del CHILDREN[pid]
+    try:
+        os.killpg(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+def our_pid(svc):
+    try:
+        pid = int(pidfile(svc).read_text())
+    except (OSError, ValueError):
+        return None
+    return pid if group_alive(pid) else None
+
+
+def port_open(port):
+    for host in ("127.0.0.1", "::1"):
+        try:
+            with socket.create_connection((host, port), timeout=0.5):
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def port_pids(port):
+    out = subprocess.run(["ss", "-ltnpH", f"sport = :{port}"], capture_output=True, text=True).stdout
+    return sorted({int(p) for p in re.findall(r"pid=(\d+)", out)})
+
+
+def http_ok(url):
+    try:
+        with urllib.request.urlopen(url, timeout=1.5) as r:
+            return 200 <= r.status < 400
+    except Exception:
+        return False
+
+
+def command_ok(cmd, item):
+    try:
+        return subprocess.run(shell(cmd, login=False), cwd=item.cwd if item.cwd.is_dir() else None,
+                              env=environ(item), capture_output=True, timeout=5).returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+
+
+def process_found(pattern):
+    return subprocess.run(["pgrep", "-f", pattern], capture_output=True).returncode == 0
+
+
+def status(svc):
+    """Running when the service's ready checks pass; Starting while its process exists but isn't ready yet."""
+    checks = [c for c in (svc.http and (lambda: http_ok(svc.http)),
+                          svc.port and not svc.http and (lambda: port_open(svc.port)),
+                          svc.ready and (lambda: command_ok(svc.ready, svc))) if c]
+    alive = bool(our_pid(svc)) or bool(svc.process and process_found(svc.process))
+    if checks:
+        if all(check() for check in checks):
+            return RUNNING
+        if alive or (svc.port and port_open(svc.port)):
+            return STARTING
+        return STOPPED
+    return RUNNING if alive else STOPPED
+
+
+def start(svc):
+    if status(svc) != STOPPED:
+        return
+    check_cwd(svc)
+    svc.log.parent.mkdir(parents=True, exist_ok=True)
+    with open(svc.log, "w") as log:
+        p = subprocess.Popen(shell(svc.start), cwd=svc.cwd, env=environ(svc), stdout=log,
+                             stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+    CHILDREN[p.pid] = p
+    pidfile(svc).write_text(str(p.pid))
+
+
+def wait_gone(pid, seconds):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if not group_alive(pid):
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def stop(svc):
+    if svc.stop:
+        try:
+            subprocess.run(shell(svc.stop), cwd=svc.cwd if svc.cwd.is_dir() else None, env=environ(svc),
+                           capture_output=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            pass
+    pid = our_pid(svc)
+    if pid and not (svc.stop and wait_gone(pid, 10)):
+        # SIGINT first, like Ctrl-C in a terminal, so tools such as Gradle shut down cleanly.
+        for sig, grace in ((signal.SIGINT, 10), (signal.SIGTERM, 5), (signal.SIGKILL, 1)):
+            try:
+                os.killpg(pid, sig)
+            except ProcessLookupError:
+                break
+            if wait_gone(pid, grace):
+                break
+    if svc.process and not svc.stop:
+        subprocess.run(["pkill", "-f", svc.process], capture_output=True)
+    if svc.port:  # whatever still listens, e.g. a server started outside Ebb
+        for p in port_pids(svc.port):
+            try:
+                os.kill(p, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+    pidfile(svc).unlink(missing_ok=True)
+
+
+def run_action(action):
+    """Run an action to completion; returns its exit code."""
+    check_cwd(action)
+    action.log.parent.mkdir(parents=True, exist_ok=True)
+    with open(action.log, "w") as log:
+        return subprocess.run(shell(action.run), cwd=action.cwd, env=environ(action), stdout=log,
+                              stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL).returncode
+
+
+# --- command line ---
+
+def cli(args):
+    projects = load_config()
+    if not projects:
+        raise ConfigError(f"No projects yet. Open Ebb to add one, or edit {CONFIG}")
+    cmd, rest = args[0], args[1:]
+    if cmd == "list":
+        for p in projects:
+            print(p.name)
+            for s in p.services:
+                print(f"  service  {s.name}")
+            for a in p.actions:
+                print(f"  action   {a.name}")
+        return 0
+    if cmd == "status":
+        for p in ([find(projects, rest[0], "project")] if rest else projects):
+            print(p.name)
+            for s in p.services:
+                print(f"  {s.name:<24} {status(s)}")
+        return 0
+    if cmd in ("start", "stop") and rest:
+        project = find(projects, rest[0], "project")
+        services = [project.service(rest[1])] if len(rest) > 1 else project.services
+        for s in services:
+            (start if cmd == "start" else stop)(s)
+            print(f"{cmd}: {s.name}")
+        return 0
+    if cmd == "run" and len(rest) == 2:
+        action = find(projects, rest[0], "project").action(rest[1])
+        code = run_action(action)
+        print(f"{action.name}: {'done' if code == 0 else f'failed (exit {code}), see {action.log}'}")
+        return code
+    print(__doc__, file=sys.stderr)
+    return 2
+
+
+if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
+    try:
+        sys.exit(cli(sys.argv[1:]))
+    except ConfigError as e:
+        sys.exit(f"ebb: {e}")
+if any(a in ("-h", "--help") for a in sys.argv[1:]):
+    sys.exit(print(__doc__))
+
+
+# --- window ---
+
+import copy  # noqa: E402
+import threading  # noqa: E402
+
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, GLib, Gio, Gtk  # noqa: E402
+
+VERSION = "0.2.0"
+ICONS = [
+    ("Server", "network-server-symbolic"),
+    ("Network", "network-workgroup-symbolic"),
+    ("Database", "drive-harddisk-symbolic"),
+    ("Phone", "phone-symbolic"),
+    ("Computer", "computer-symbolic"),
+    ("Terminal", "utilities-terminal-symbolic"),
+    ("Program", "application-x-executable-symbolic"),
+    ("Build", "applications-engineering-symbolic"),
+    ("Tests", "emblem-ok-symbolic"),
+    ("Run", "media-playback-start-symbolic"),
+    ("Sync", "emblem-synchronizing-symbolic"),
+    ("Settings", "emblem-system-symbolic"),
+    ("Science", "applications-science-symbolic"),
+    ("Search", "edit-find-symbolic"),
+    ("Folder", "folder-symbolic"),
+    ("Document", "text-x-generic-symbolic"),
+    ("Mail", "mail-unread-symbolic"),
+    ("Game", "applications-games-symbolic"),
+    ("Star", "starred-symbolic"),
+    ("Gear", "system-run-symbolic"),
+]
+ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def in_background(work, done=None):
+    """Run work() off the UI thread, then done(result, error) on it."""
+    def go():
+        try:
+            result, error = work(), None
+        except Exception as e:  # shown to the user as a toast
+            result, error = None, e
+        if done:
+            GLib.idle_add(lambda: done(result, error) and False)
+    threading.Thread(target=go, daemon=True).start()
+
+
+def home_short(path):
+    p, home = str(path), str(Path.home())
+    return "~" + p[len(home):] if p == home or p.startswith(home + "/") else p
+
+
+def put(table, key, value):
+    """Set a config key, or drop it when empty so the file stays tidy."""
+    if value in ("", None, {}, False):
+        table.pop(key, None)
+    else:
+        table[key] = value
+
+
+def icon(name, size=24):
+    path = Path(expand(name))
+    image = Gtk.Image.new_from_file(str(path)) if path.is_file() else Gtk.Image.new_from_icon_name(name)
+    image.set_pixel_size(size)
+    return image
+
+
+def icon_button(icon_name, tooltip, handler, *css):
+    b = Gtk.Button(icon_name=icon_name, tooltip_text=tooltip, valign=Gtk.Align.CENTER,
+                   css_classes=["flat", *css])
+    b.connect("clicked", lambda *_: handler())
+    return b
+
+
+def open_file(path):
+    if path.exists():
+        Gio.AppInfo.launch_default_for_uri(path.as_uri(), None)
+
+
+# --- editor widgets ---
+
+class FolderRow(Adw.ActionRow):
+    """A folder picker. With a base folder, folders inside it are stored relative to it."""
+
+    def __init__(self, title, value, base, empty_text):
+        super().__init__(title=title)
+        self.base, self.empty_text = base, empty_text
+        pick = icon_button("folder-open-symbolic", "Choose folder", self.choose)
+        self.clear = icon_button("edit-clear-symbolic", "Reset", lambda: self.set(""))
+        self.add_suffix(self.clear)
+        self.add_suffix(pick)
+        self.set_activatable_widget(pick)
+        self.set(value or "")
+
+    def set(self, value):
+        self.value = value
+        self.set_subtitle(value or self.empty_text)
+        self.clear.set_visible(bool(value))
+
+    def resolved(self):
+        if self.base is None:
+            return Path(expand(self.value or "~"))
+        return Path(expand(self.base)) / expand(self.value or ".")
+
+    def choose(self):
+        dialog = Gtk.FileDialog(title=f"Choose {self.get_title().lower()}")
+        if self.resolved().is_dir():
+            dialog.set_initial_folder(Gio.File.new_for_path(str(self.resolved())))
+        dialog.select_folder(self.get_root(), None, self.chosen)
+
+    def chosen(self, dialog, result):
+        try:
+            path = Path(dialog.select_folder_finish(result).get_path())
+        except GLib.Error:
+            return  # cancelled
+        if self.base is not None:
+            try:
+                relative = path.relative_to(Path(expand(self.base)))
+                self.set("" if str(relative) == "." else str(relative))
+                return
+            except ValueError:
+                pass
+        self.set(home_short(path))
+
+
+class IconRow(Adw.ComboRow):
+    def __init__(self, value, default):
+        super().__init__(title="Icon")
+        value = value or default
+        self.choices = list(ICONS)
+        if value not in [name for _, name in self.choices]:
+            self.choices.insert(0, ("Custom", value))
+        self.set_model(Gtk.StringList.new([name for _, name in self.choices]))
+        factory = Gtk.SignalListItemFactory()
+        factory.connect("setup", self.setup_item)
+        factory.connect("bind", self.bind_item)
+        self.set_factory(factory)
+        self.set_selected([name for _, name in self.choices].index(value))
+
+    def setup_item(self, _, item):
+        box = Gtk.Box(spacing=10)
+        box.append(Gtk.Image())
+        box.append(Gtk.Label(xalign=0))
+        item.set_child(box)
+
+    def bind_item(self, _, item):
+        name = item.get_item().get_string()
+        box = item.get_child()
+        image = box.get_first_child()
+        if Path(expand(name)).is_file():
+            image.set_from_file(expand(name))
+        else:
+            image.set_from_icon_name(name)
+        box.get_last_child().set_label(next(label for label, n in self.choices if n == name))
+
+    @property
+    def value(self):
+        return self.choices[self.get_selected()][1]
+
+
+class EnvGroup(Adw.PreferencesGroup):
+    """Environment variables as editable rows, plus a row to add one."""
+
+    def __init__(self, env, description):
+        super().__init__(title="Environment variables", description=description)
+        self.rows = []
+        self.adder = Adw.EntryRow(title="Add a variable: type its name and press Enter", show_apply_button=True)
+        self.adder.connect("apply", lambda *_: self.on_add())
+        self.adder.connect("changed", lambda *_: self.adder.remove_css_class("error"))
+        self.add(self.adder)
+        for key, value in (env or {}).items():
+            self.add_var(key, str(value))
+
+    def add_var(self, key, value=""):
+        row = Adw.EntryRow(title=key, text=value)
+        row.add_suffix(icon_button("user-trash-symbolic", f"Remove {key}", lambda: self.remove_var(row)))
+        self.remove(self.adder)
+        self.add(row)
+        self.add(self.adder)
+        self.rows.append(row)
+        return row
+
+    def remove_var(self, row):
+        self.rows.remove(row)
+        self.remove(row)
+
+    def on_add(self):
+        key = self.adder.get_text().strip()
+        if not ENV_NAME.match(key) or key in (r.get_title() for r in self.rows):
+            self.adder.add_css_class("error")
+            return
+        self.adder.set_text("")
+        self.add_var(key).grab_focus()
+
+    @property
+    def value(self):
+        return {r.get_title(): r.get_text() for r in self.rows}
+
+
+class Editor(Adw.Dialog):
+    """A form with Cancel/Save in its header. Subclasses add groups and implement save()."""
+
+    def __init__(self, win, title):
+        super().__init__(title=title, content_width=620, content_height=720)
+        self.win, self.checks = win, []
+        cancel = Gtk.Button(label="Cancel")
+        cancel.connect("clicked", lambda *_: self.close())
+        self.save_button = Gtk.Button(label="Save", css_classes=["suggested-action"])
+        self.save_button.connect("clicked", lambda *_: self.save() and self.close())
+        header = Adw.HeaderBar(show_start_title_buttons=False, show_end_title_buttons=False)
+        header.pack_start(cancel)
+        header.pack_end(self.save_button)
+        self.page = Adw.PreferencesPage()
+        view = Adw.ToolbarView()
+        view.add_top_bar(header)
+        view.set_content(self.page)
+        self.set_child(view)
+
+    def group(self, title=None, description=None):
+        group = Adw.PreferencesGroup(title=title or "",
+                                     description=description and GLib.markup_escape_text(description))
+        self.page.add(group)
+        return group
+
+    def entry(self, group, title, text="", valid=None, digits=False):
+        """An entry row; valid(text) -> bool makes it required/checked (shown red only once typed in)."""
+        row = Adw.EntryRow(title=title, text="" if text is None else str(text))
+        if digits:
+            row.set_input_purpose(Gtk.InputPurpose.DIGITS)
+        if valid:
+            self.checks.append((row, valid))
+            row.connect("changed", lambda *_: self.validate())
+        group.add(row)
+        return row
+
+    def validate(self):
+        ok = True
+        for row, valid in self.checks:
+            good = valid(row.get_text().strip())
+            ok = ok and good
+            if good or not row.get_text():
+                row.remove_css_class("error")
+            else:
+                row.add_css_class("error")
+        self.save_button.set_sensitive(ok)
+
+    def delete_button(self, label, heading, body, delete):
+        button = Adw.ButtonRow(title=label, css_classes=["destructive-action"])
+        button.connect("activated", lambda *_: self.confirm(heading, body, delete))
+        self.group().add(button)
+
+    def confirm(self, heading, body, delete):
+        alert = Adw.AlertDialog(heading=heading, body=body)
+        alert.add_response("cancel", "Cancel")
+        alert.add_response("delete", "Delete")
+        alert.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+        alert.set_default_response("cancel")
+        alert.set_close_response("cancel")
+        alert.connect("response", lambda _, r: r == "delete" and delete() and self.close())
+        alert.present(self)
+
+    def save(self):
+        raise NotImplementedError
+
+
+def unique(names, current=None):
+    """valid() for a name that must be set and differ from the others (ignoring case and punctuation)."""
+    taken = {slug(n) for n in names if n != current}
+    return lambda text: bool(text) and slug(text) not in taken
+
+
+class ProjectEditor(Editor):
+    def __init__(self, win, index=None):
+        super().__init__(win, "Edit project" if index is not None else "New project")
+        self.index = index
+        raw = win.data["project"][index] if index is not None else {}
+        names = [p.get("name", "") for p in win.data.get("project", [])]
+
+        g = self.group()
+        self.name = self.entry(g, "Name", raw.get("name"), unique(names, raw.get("name")))
+        self.description = self.entry(g, "Description", raw.get("description"))
+        self.folder = FolderRow("Folder", raw.get("cwd", ""), None, "Home folder")
+        self.folder.set_tooltip_text("Commands run here unless a service or action picks another folder")
+        g.add(self.folder)
+
+        self.env = EnvGroup(raw.get("env"), "For every service and action in this project. "
+                                            "~ and $VARIABLES are expanded.")
+        self.page.add(self.env)
+        if index is not None:
+            self.delete_button("Delete project", f"Delete {raw.get('name')}?",
+                               "Its services and actions are removed from Ebb. Running services keep running, "
+                               "and no files are deleted.", self.delete)
+        self.validate()
+
+    def save(self):
+        name = self.name.get_text().strip()
+
+        def change(data):
+            projects = data.setdefault("project", [])
+            project = projects[self.index] if self.index is not None else {}
+            put(project, "name", name)
+            put(project, "description", self.description.get_text().strip())
+            put(project, "cwd", self.folder.value)
+            put(project, "env", self.env.value)
+            if self.index is None:
+                projects.append(project)
+        return self.win.change(change, select=name)
+
+    def delete(self):
+        return self.win.change(lambda data: data["project"].pop(self.index))
+
+
+class ItemEditor(Editor):
+    """Edits one [[project.service]] (kind "service") or [[project.action]] (kind "action")."""
+
+    def __init__(self, win, pindex, kind, index=None):
+        super().__init__(win, f"{'Edit' if index is not None else 'New'} {kind}")
+        self.pindex, self.kind, self.index = pindex, kind, index
+        project = win.data["project"][pindex]
+        items = project.get(kind, [])
+        raw = items[index] if index is not None else {}
+        service = kind == "service"
+
+        g = self.group()
+        self.name = self.entry(g, "Name", raw.get("name"), unique([i.get("name", "") for i in items], raw.get("name")))
+        self.description = self.entry(g, "Description", raw.get("description"))
+        self.icon = IconRow(raw.get("icon"), "system-run-symbolic" if service else "media-playback-start-symbolic")
+        g.add(self.icon)
+
+        g = self.group("Command", "Runs in bash, so &&, pipes, ~ and $VARIABLES work."
+                       + (" The start command should keep running until it's stopped." if service else ""))
+        self.folder = FolderRow("Folder", raw.get("cwd", ""), project.get("cwd", "~"), "Project folder")
+        g.add(self.folder)
+        if service:
+            self.command = self.entry(g, "Start command", raw.get("start"), bool)
+            self.stop = self.entry(g, "Stop command (optional: default is Ctrl-C)", raw.get("stop"))
+            g = self.group("Status checks", "Ebb shows Running when every check you fill in passes, and "
+                           "Starting… while it waits. Leave them empty to just watch the process Ebb started.")
+            self.http = self.entry(g, "URL that answers when it's up", raw.get("http"))
+            self.port = self.entry(g, "Port it listens on (also freed on Stop)", raw.get("port"),
+                                   lambda t: not t or (t.isdigit() and 0 < int(t) < 65536), digits=True)
+            self.ready = self.entry(g, "Command that succeeds when it's ready", raw.get("ready"))
+            self.process = self.entry(g, "Process pattern for pgrep -f (finds it even if started elsewhere)",
+                                      raw.get("process"))
+        else:
+            self.command = self.entry(g, "Command", raw.get("run"), bool)
+            self.highlight = Adw.SwitchRow(title="Highlight the Run button",
+                                           subtitle="Makes it stand out, for the action you use most",
+                                           active=bool(raw.get("highlight")))
+            g.add(self.highlight)
+
+        self.env = EnvGroup(raw.get("env"), f"Only for this {kind}. ~ and $VARIABLES are expanded.")
+        self.page.add(self.env)
+        if index is not None:
+            self.delete_button(f"Delete {kind}", f"Delete {raw.get('name')}?",
+                               f"It's removed from Ebb. {'A running service keeps running. ' if service else ''}"
+                               "No files are deleted.", self.delete)
+        self.validate()
+
+    def save(self):
+        def text(row):
+            return row.get_text().strip()
+
+        def change(data):
+            items = data["project"][self.pindex].setdefault(self.kind, [])
+            item = items[self.index] if self.index is not None else {}
+            put(item, "name", text(self.name))
+            put(item, "description", text(self.description))
+            put(item, "icon", self.icon.value)
+            put(item, "cwd", self.folder.value)
+            if self.kind == "service":
+                put(item, "start", text(self.command))
+                put(item, "stop", text(self.stop))
+                put(item, "http", text(self.http))
+                put(item, "port", int(text(self.port)) if text(self.port) else None)
+                put(item, "ready", text(self.ready))
+                put(item, "process", text(self.process))
+            else:
+                put(item, "run", text(self.command))
+                put(item, "highlight", self.highlight.get_active())
+            put(item, "env", self.env.value)
+            if self.index is None:
+                items.append(item)
+        return self.win.change(change, select=self.win.data["project"][self.pindex]["name"])
+
+    def delete(self):
+        return self.win.change(lambda data: data["project"][self.pindex][self.kind].pop(self.index))
+
+
+class GlobalEnvEditor(Editor):
+    def __init__(self, win):
+        super().__init__(win, "Environment for all projects")
+        self.env = EnvGroup(win.data.get("env"), "Set for every command in every project. A project, service or "
+                                                 "action can override them. ~ and $VARIABLES are expanded.")
+        self.page.add(self.env)
+
+    def save(self):
+        return self.win.change(lambda data: put(data, "env", self.env.value))
+
+
+# --- main window ---
+
+class ServiceRow(Adw.ActionRow):
+    def __init__(self, win, svc, edit):
+        super().__init__(use_markup=False, subtitle_lines=1)
+        self.set_title(svc.name)
+        self.set_subtitle(svc.description or svc.start)
+        self.win, self.svc, self.busy = win, svc, False
+        self.add_prefix(icon(svc.icon))
+        self.state = Gtk.Label(css_classes=["dim-label", "caption"])
+        self.spinner = Adw.Spinner(visible=False)
+        self.start_btn = icon_button("media-playback-start-symbolic", "Start", lambda: self.act(start, "Starting…"))
+        self.stop_btn = icon_button("media-playback-stop-symbolic", "Stop", lambda: self.act(stop, "Stopping…"))
+        for w in (self.spinner, self.state, self.start_btn, self.stop_btn,
+                  icon_button("document-open-symbolic", "Open log", lambda: open_file(svc.log)),
+                  icon_button("document-edit-symbolic", "Edit", edit)):
+            self.add_suffix(w)
+
+    def act(self, fn, text):
+        self.set_busy(text)
+        in_background(lambda: fn(self.svc), self.finished)
+
+    def finished(self, _, error):
+        self.busy = False
+        if error:
+            self.win.toast(f"{self.svc.name}: {error}")
+        self.win.refresh()
+
+    def set_busy(self, text):
+        self.busy = True
+        self.show(text)
+
+    def show(self, text):
+        self.spinner.set_visible(text.endswith("…"))
+        self.state.set_label(text)
+        self.state.set_css_classes(["caption", "success" if text == RUNNING else "dim-label"])
+        self.start_btn.set_visible(text == STOPPED)
+        self.stop_btn.set_visible(text != STOPPED and not self.busy)
+
+    def update(self, state):
+        if not self.busy:
+            self.show(state)
+
+
+class ActionRow(Adw.ActionRow):
+    def __init__(self, win, action, edit):
+        super().__init__(use_markup=False, subtitle_lines=1)
+        self.set_title(action.name)
+        self.set_subtitle(action.description or action.run)
+        self.win, self.action = win, action
+        self.add_prefix(icon(action.icon))
+        self.spinner = Adw.Spinner(visible=False)
+        self.run_btn = Gtk.Button(label="Run", valign=Gtk.Align.CENTER,
+                                  css_classes=["suggested-action"] if action.highlight else [])
+        self.run_btn.connect("clicked", lambda *_: self.run())
+        for w in (self.spinner, self.run_btn,
+                  icon_button("document-open-symbolic", "Open log", lambda: open_file(action.log)),
+                  icon_button("document-edit-symbolic", "Edit", edit)):
+            self.add_suffix(w)
+
+    def run(self):
+        self.run_btn.set_sensitive(False)
+        self.spinner.set_visible(True)
+        in_background(lambda: run_action(self.action), self.finished)
+
+    def finished(self, code, error):
+        self.run_btn.set_sensitive(True)
+        self.spinner.set_visible(False)
+        if error:
+            self.win.toast(f"{self.action.name}: {error}")
+        elif code == 0:
+            self.win.toast(f"{self.action.name}: done")
+        else:
+            self.win.toast(f"{self.action.name} failed (exit {code})", self.action.log)
+
+
+def add_row(title, handler):
+    row = Adw.ButtonRow(title=title, start_icon_name="list-add-symbolic")
+    row.connect("activated", lambda *_: handler())
+    return row
+
+
+def project_page(win, project, pindex):
+    def editor(*args):
+        return lambda: win.open_editor(*args)
+
+    page = Adw.PreferencesPage()
+    header = Adw.PreferencesGroup()
+    box = Gtk.Box(spacing=12)
+    text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, hexpand=True)
+    text.append(Gtk.Label(label=project.name, xalign=0, wrap=True, css_classes=["title-2"]))
+    if project.description:
+        text.append(Gtk.Label(label=project.description, xalign=0, wrap=True, css_classes=["dim-label"]))
+    text.append(Gtk.Label(label=home_short(project.cwd), xalign=0, css_classes=["caption", "dim-label", "monospace"]))
+    box.append(text)
+    edit = Gtk.Button(child=Adw.ButtonContent(icon_name="document-edit-symbolic", label="Edit project"),
+                      valign=Gtk.Align.CENTER, css_classes=["flat"])
+    edit.connect("clicked", lambda *_: win.open_editor(ProjectEditor, pindex))
+    box.append(edit)
+    header.add(box)
+    page.add(header)
+
+    rows = []
+    services = Adw.PreferencesGroup(title="Services")
+    if project.services:
+        buttons = Gtk.Box(spacing=6)
+        for label, fn in (("Start all", start), ("Stop all", stop)):
+            b = Gtk.Button(label=label, css_classes=["flat"])
+            b.connect("clicked", lambda _, fn=fn: win.all(rows, fn))
+            buttons.append(b)
+        services.set_header_suffix(buttons)
+    for i, svc in enumerate(project.services):
+        row = ServiceRow(win, svc, editor(ItemEditor, pindex, "service", i))
+        rows.append(row)
+        services.add(row)
+    services.add(add_row("Add service", editor(ItemEditor, pindex, "service")))
+    page.add(services)
+
+    actions = Adw.PreferencesGroup(title="Actions")
+    for i, action in enumerate(project.actions):
+        actions.add(ActionRow(win, action, editor(ItemEditor, pindex, "action", i)))
+    actions.add(add_row("Add action", editor(ItemEditor, pindex, "action")))
+    page.add(actions)
+    return page, rows
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Ebb", default_width=920, default_height=640)
+        self.rows, self.refreshing, self.data, self.stack, self.told_backup = [], False, None, None, False
+
+        self.actions = {}
+        for name, fn in (("add-project", lambda: self.open_editor(ProjectEditor)),
+                         ("global-env", lambda: self.open_editor(GlobalEnvEditor)),
+                         ("reload", self.load),
+                         ("open-config", lambda: open_file(CONFIG)),
+                         ("about", self.about)):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", lambda *_, fn=fn: fn())
+            self.add_action(action)
+            self.actions[name] = action
+
+        header = Adw.HeaderBar()
+        add = Gtk.Button(icon_name="list-add-symbolic", tooltip_text="Add project", action_name="win.add-project")
+        header.pack_start(add)
+        menu = Gio.Menu()
+        menu.append("Environment for all projects", "win.global-env")
+        section = Gio.Menu()
+        section.append("Reload config", "win.reload")
+        section.append("Open config file", "win.open-config")
+        menu.append_section(None, section)
+        about = Gio.Menu()
+        about.append("About Ebb", "win.about")
+        menu.append_section(None, about)
+        header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu, primary=True,
+                                       tooltip_text="Menu"))
+
+        self.toasts = Adw.ToastOverlay()
+        view = Adw.ToolbarView()
+        view.add_top_bar(header)
+        view.set_content(self.toasts)
+        self.set_content(view)
+
+        self.load()
+        GLib.timeout_add_seconds(3, self.refresh)
+
+    def load(self, select=None):
+        if select is None and self.stack:
+            select = self.stack.get_visible_child_name()
+        self.rows, self.stack = [], None
+        try:
+            self.data = read_raw()
+            projects = parse(self.data)
+        except ConfigError as e:
+            self.data = None
+            self.show_body(self.message("The config file has a problem", str(e), "dialog-warning-symbolic",
+                                        [("Open config file", "win.open-config"), ("Try again", "win.reload")]))
+            return
+        if not projects:
+            self.show_body(self.message("No projects yet",
+                                        "Add a project, then its services and actions, to start and stop "
+                                        "them from here.", APP_ID, [("Add project", "win.add-project")]))
+            return
+
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, hexpand=True)
+        for pindex, project in enumerate(projects):
+            page, rows = project_page(self, project, pindex)
+            self.rows += rows
+            self.stack.add_titled(page, slug(project.name), project.name)
+        sidebar = Gtk.StackSidebar(stack=self.stack, width_request=200)
+        box = Gtk.Box()
+        box.append(sidebar)
+        box.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+        box.append(self.stack)
+        self.show_body(box)
+        if select:
+            self.select(select)
+        self.refresh()
+
+    def show_body(self, widget):
+        self.toasts.set_child(widget)
+        for name in ("add-project", "global-env"):
+            self.actions[name].set_enabled(self.data is not None)
+
+    def message(self, title, text, icon_name, buttons):
+        page = Adw.StatusPage(title=title, description=GLib.markup_escape_text(text), icon_name=icon_name)
+        box = Gtk.Box(spacing=12, halign=Gtk.Align.CENTER)
+        for i, (label, action) in enumerate(buttons):
+            box.append(Gtk.Button(label=label, action_name=action,
+                                  css_classes=["pill"] + (["suggested-action"] if i == 0 else [])))
+        page.set_child(box)
+        return page
+
+    def select(self, name):
+        if self.stack and self.stack.get_child_by_name(slug(name)):
+            self.stack.set_visible_child_name(slug(name))
+
+    def open_editor(self, cls, *args):
+        if self.data is not None:
+            cls(self, *args).present(self)
+
+    def change(self, mutate, select=None):
+        """Apply mutate() to a copy of the config, save it and rebuild the window. Returns True on success."""
+        data = copy.deepcopy(self.data)
+        mutate(data)
+        try:
+            save_raw(data)
+        except (ConfigError, OSError) as e:
+            self.toast(f"Couldn't save: {e}")
+            return False
+        self.load(select)
+        if not self.told_backup:
+            self.toast(f"Saved. The previous version is kept as {CONFIG.name}.bak")
+            self.told_backup = True
+        return True
+
+    def toast(self, text, log=None):
+        t = Adw.Toast(title=GLib.markup_escape_text(text), timeout=5)
+        if log:
+            t.set_button_label("Log")
+            t.connect("button-clicked", lambda *_: open_file(log))
+        self.toasts.add_toast(t)
+
+    def about(self):
+        Adw.AboutDialog(application_name="Ebb", application_icon=APP_ID, version=VERSION, developer_name="Tomiloba",
+                        comments="Start, stop and watch your dev projects.", license_type=Gtk.License.MIT_X11,
+                        website="https://github.com/Tomiloba21/ebb").present(self)
+
+    def all(self, rows, fn):
+        for row in rows:
+            row.set_busy("Starting…" if fn is start else "Stopping…")
+        in_background(lambda: [fn(r.svc) for r in rows], lambda _, e: self.all_done(rows, e))
+
+    def all_done(self, rows, error):
+        for row in rows:
+            row.busy = False
+        if error:
+            self.toast(str(error))
+        self.refresh()
+
+    def refresh(self):
+        if self.refreshing or not self.rows:
+            return True
+        self.refreshing = True
+        rows = list(self.rows)
+
+        def done(states, _):
+            self.refreshing = False
+            for row, state in zip(rows, states or []):
+                row.update(state)
+        in_background(lambda: [status(r.svc) for r in rows], done)
+        return True
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+        self.add_main_option("project", ord("p"), GLib.OptionFlags.NONE, GLib.OptionArg.STRING,
+                             "Open on this project", "NAME")
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        self.set_accels_for_action("win.reload", ["<Control>r"])
+        self.set_accels_for_action("win.add-project", ["<Control>n"])
+
+    def do_command_line(self, command_line):
+        win = self.props.active_window or Window(self)
+        project = command_line.get_options_dict().lookup_value("project")
+        if project:
+            win.select(project.get_string())
+        win.present()
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(App().run(sys.argv))

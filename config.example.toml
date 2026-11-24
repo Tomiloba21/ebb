@@ -1,0 +1,61 @@
+# Ebb config: copy to ~/.config/ebb/config.toml and edit.
+# Every [[project]] gets its own page. Commands run in bash, so pipes, && and $VARS work.
+
+# Environment for every command (optional).
+[env]
+# JAVA_HOME = "/usr/lib/jvm/java-21-openjdk"
+
+
+[[project]]
+name = "My web app"
+description = "API and frontend"
+cwd = "~/code/my-web-app"            # commands run here unless a service or action sets its own cwd
+
+  # A service is something that keeps running. Ebb starts it in the background and tells you
+  # whether it's up. Status checks (use any, all must pass): http, port, ready.
+  [[project.service]]
+  name = "API"
+  description = "localhost:8000"
+  cwd = "api"                          # relative to the project's cwd
+  start = "uvicorn app.main:app --reload"
+  http = "http://localhost:8000/health" # up when this answers 2xx/3xx
+  port = 8000                           # also frees this port on Stop
+  icon = "network-server-symbolic"
+
+  [[project.service]]
+  name = "Frontend"
+  cwd = "web"
+  start = "npm run dev"
+  port = 5173
+  icon = "network-workgroup-symbolic"
+  env = { BROWSER = "none" }
+
+  # An action is a one-off command with a Run button: build, test, migrate, open something.
+  [[project.action]]
+  name = "Run tests"
+  run = "cd api && pytest -q"
+  icon = "emblem-ok-symbolic"
+
+  [[project.action]]
+  name = "Open in browser"
+  run = "xdg-open http://localhost:5173"
+  highlight = true                     # makes the Run button stand out
+
+
+[[project]]
+name = "Android app"
+cwd = "~/code/my-android-app"
+env = { ANDROID_HOME = "~/Android/Sdk" }
+
+  [[project.service]]
+  name = "Emulator"
+  start = "$ANDROID_HOME/emulator/emulator -avd Pixel_8 -gpu host"
+  stop = "adb emu kill"                       # custom stop command (default: Ctrl-C, then terminate)
+  process = "qemu-system.*-avd Pixel_8"       # counts as started if this process exists
+  ready = "adb shell getprop sys.boot_completed | grep -q 1"   # up when this exits 0
+  icon = "phone-symbolic"
+
+  [[project.action]]
+  name = "Build & install"
+  run = "./gradlew :app:installDebug && adb shell am start -n com.example.app/.MainActivity"
+  highlight = true
